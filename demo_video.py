@@ -1,28 +1,38 @@
+import os
+import json
+import argparse
 import copy
-import time
-
 import numpy as np
 import cv2
-from glob import glob
-import os
-import argparse
-import json
-#demo_video.py <视频文件路径>
-#python demo_video.py video/1.mp4
-# video file processing setup
-# from: https://stackoverflow.com/a/61927951
-import argparse
 import subprocess
-import sys
-from pathlib import Path
 from typing import NamedTuple
+from tqdm import tqdm
+from src import util
+from src.body import Body
+from src.hand import Hand
+import ffmpeg
+import imageio
 
+# 初始化 OpenPose 模型
+body_estimation = Body('model/body_pose_model.pth')
+hand_estimation = Hand('model/hand_pose_model.pth')
+
+class Writer():
+    def __init__(self, output_file, input_fps, input_framesize, output_params):
+        if os.path.exists(output_file):
+            os.remove(output_file)
+        self.writer = imageio.get_writer(output_file, fps=input_fps, quality=output_params.get("q", 5))
+
+    def __call__(self, frame):
+        self.writer.append_data(frame)
+
+    def close(self):
+        self.writer.close()
 
 class FFProbeResult(NamedTuple):
     return_code: int
     json: str
     error: str
-
 
 def ffprobe(file_path) -> FFProbeResult:
     command_array = ["ffprobe",
@@ -35,16 +45,6 @@ def ffprobe(file_path) -> FFProbeResult:
     return FFProbeResult(return_code=result.returncode,
                          json=result.stdout,
                          error=result.stderr)
-
-
-# openpose setup
-from src import model
-from src import util
-from src.body import Body
-from src.hand import Hand
-
-body_estimation = Body('model/body_pose_model.pth')
-hand_estimation = Hand('model/hand_pose_model.pth')
 
 def process_frame(frame, body=True, hands=True):
     canvas = copy.deepcopy(frame)
@@ -60,89 +60,60 @@ def process_frame(frame, body=True, hands=True):
             peaks[:, 1] = np.where(peaks[:, 1]==0, peaks[:, 1], peaks[:, 1]+y)
             all_hand_peaks.append(peaks)
         canvas = util.draw_handpose(canvas, all_hand_peaks)
+
+    # 在这里添加颜色空间转换
+    canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)  # 从BGR转换为RGB
+
     return canvas
 
-# writing video with ffmpeg because cv2 writer failed
-# https://stackoverflow.com/questions/61036822/opencv-videowriter-produces-cant-find-starting-number-error
-import ffmpeg
+def generate_output_video(video_file, output_file, input_fps, input_framesize, output_params):
+    cap = cv2.VideoCapture(video_file)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-# open specified video
-parser = argparse.ArgumentParser(
-        description="Process a video annotating poses detected.")
-parser.add_argument('file', type=str, help='Video file location to process.')
-parser.add_argument('--no_hands', action='store_true', help='No hand pose')
-parser.add_argument('--no_body', action='store_true', help='No body pose')
-args = parser.parse_args()
-video_file = args.file
-cap = cv2.VideoCapture(video_file)
+    writer = Writer(output_file, input_fps, input_framesize, output_params)
 
-# get video file info
-ffprobe_result = ffprobe(args.file)
-info = json.loads(ffprobe_result.json)
-videoinfo = [i for i in info["streams"] if i["codec_type"] == "video"][0]
-input_fps = videoinfo["avg_frame_rate"]
-# input_fps = float(input_fps[0])/float(input_fps[1])
-input_pix_fmt = videoinfo["pix_fmt"]
-input_vcodec = videoinfo["codec_name"]
+    for frame_num in tqdm(range(total_frames)):
+        ret, frame = cap.read()
+        if frame is None:
+            break
 
-# define a writer object to write to a movidified file
-postfix = info["format"]["format_name"].split(",")[0]
-output_file = ".".join(video_file.split(".")[:-1])+".processed." + postfix
+        # 在这里添加亮度和对比度调整
+        frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=10)
 
+        posed_frame = process_frame(frame)
 
-class Writer():
-    def __init__(self, output_file, input_fps, input_framesize, input_pix_fmt,
-                 input_vcodec):
-        if os.path.exists(output_file):
-            os.remove(output_file)
-        self.ff_proc = (
-            ffmpeg.input('pipe:',
-                         format='rawvideo',
-                         pix_fmt="bgr24",
-                         s='{}x{}'.format((input_framesize[0] // 2) * 2, (input_framesize[1] // 2) * 2),
+        writer(posed_frame)
 
-                         r=input_fps)
-            .output(output_file, pix_fmt=input_pix_fmt, vcodec='libx264', crf=23)#vcodec=input_vcodec
-            .overwrite_output()
-            .run_async(pipe_stdin=True)
-        )
+        cv2.imshow('frame', posed_frame)
 
-    def __call__(self, frame):
-        self.ff_proc.stdin.write(frame.astype(np.uint8).tobytes())
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-    def close(self):
-        self.ff_proc.stdin.close()
-        self.ff_proc.wait()
+        if frame_num == total_frames - 1:
+            # 当视频完全处理时跳出循环
+            break
 
+    cap.release()
+    writer.close()
+    cv2.destroyAllWindows()
 
-writer = None
-while(cap.isOpened()):
-    ret, frame = cap.read()
-    if frame is None:
-        break
-        # 打印当前处理的帧数
-    print(f"处理帧 {cap.get(cv2.CAP_PROP_POS_FRAMES)}/{cap.get(cv2.CAP_PROP_FRAME_COUNT)}")
-    posed_frame = process_frame(frame, body=not args.no_body,
-                                hands=not args.no_hands)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Process a video annotating poses detected.")
+    parser.add_argument('file', type=str, help='Video file location to process.')
+    args = parser.parse_args()
+    video_file = args.file
 
-    if writer is None:
-        input_framesize = posed_frame.shape[:2]
-        writer = Writer(output_file, input_fps, input_framesize, input_pix_fmt,
-                        input_vcodec)
+    # 获取视频文件信息
+    ffprobe_result = ffprobe(args.file)
+    info = json.loads(ffprobe_result.json)
+    videoinfo = [i for i in info["streams"] if i["codec_type"] == "video"][0]
+    input_fps = eval(videoinfo["avg_frame_rate"])
+    print("Input FPS:", input_fps)
+    input_framesize = (int(videoinfo["width"]), int(videoinfo["height"]))
+    output_params = {'q': 5}  # 调整输出参数，例如quality
 
-    cv2.imshow('frame', posed_frame)
-    cv2.waitKey(1)  # Add this line to ensure the window is updated and responsive
+    # 定义一个写入对象以写入修改后的文件
+    postfix = info["format"]["format_name"].split(",")[0]
+    output_file = ".".join(video_file.split(".")[:-1]) + ".processed." + postfix
 
-    # 减缓速度
-    time.sleep(0.01)
-    # write the frame
-    writer(posed_frame)
-
-    print(f"Processed frame {cap.get(cv2.CAP_PROP_POS_FRAMES)}/{cap.get(cv2.CAP_PROP_FRAME_COUNT)}")
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-writer.close()
-cv2.destroyAllWindows()
+    generate_output_video(video_file, output_file, input_fps, input_framesize, output_params)
