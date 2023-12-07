@@ -11,7 +11,7 @@ from src.hand import Hand
 body_estimation = Body('model/body_pose_model.pth')
 hand_estimation = Hand('model/hand_pose_model.pth')
 
-test_image = 'images/demo.jpg'
+test_image = 'images/b.jpg'
 oriImg = cv2.imread(test_image)  # B,G,R order
 candidate, subset = body_estimation(oriImg)
 canvas = copy.deepcopy(oriImg)
